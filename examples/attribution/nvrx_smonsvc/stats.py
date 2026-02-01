@@ -1,0 +1,207 @@
+#  Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+#  NVIDIA CORPORATION and its licensors retain all intellectual property
+#  and proprietary rights in and to this software, related documentation
+#  and any modifications thereto.  Any use, reproduction, disclosure or
+#  distribution of this software and related documentation without an express
+#  license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+"""Stats calculation and formatting for nvrx_smonsvc."""
+
+import threading
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from .attrsvc_client import AttrsvcClient
+    from .models import MonitorState
+
+
+def get_stats_dict(
+    state: "MonitorState",
+    lock: threading.Lock,
+) -> dict:
+    """
+    Build stats dictionary for HTTP endpoint.
+
+    Args:
+        state: MonitorState with job and counter data
+        lock: Lock for thread-safe state access
+
+    Returns:
+        Stats dictionary with jobs, cumulative, slurm, path_errors, http_errors
+    """
+    with lock:
+        jobs = state.jobs
+        running = sum(1 for j in jobs.values() if j.state.is_running())
+        terminal = sum(1 for j in jobs.values() if j.state.is_terminal())
+        submitted = sum(1 for j in jobs.values() if j.log_submitted)
+        post_success = sum(1 for j in jobs.values() if j.post_success)
+        fetched = sum(1 for j in jobs.values() if j.result_fetched)
+        has_path = sum(1 for j in jobs.values() if j.stdout_path)
+        total = len(jobs)
+
+        return {
+            "jobs": {
+                "total": total,
+                "running": running,
+                "terminal": terminal,
+                "has_output_path": has_path,
+                "logs_submitted": submitted,
+                "logs_post_success": post_success,
+                "results_fetched": fetched,
+            },
+            "cumulative": {
+                "total": state.total_jobs_seen,
+                "has_output_path": state.total_with_output_path,
+                "logs_submitted": state.total_logs_submitted,
+                "logs_post_success": state.total_post_success,
+                "results_fetched": state.total_results_fetched,
+            },
+            "slurm": {
+                "squeue_calls": state.squeue_calls,
+                "scontrol_calls": state.scontrol_calls,
+                "sacct_calls": state.sacct_calls,
+                "squeue_failures": state.squeue_failures,
+                "scontrol_failures": state.scontrol_failures,
+                "sacct_failures": state.sacct_failures,
+            },
+            "path_errors": {
+                "permission_denied": state.path_errors_permission,
+                "not_found": state.path_errors_not_found,
+                "file_empty": state.path_errors_empty,
+                "unexpanded_patterns": state.path_errors_unexpanded,
+                "other": state.path_errors_other,
+            },
+            "http_errors": {
+                "rate_limited": state.http_rate_limited,
+            },
+        }
+
+
+def get_jobs_list(
+    state: "MonitorState",
+    lock: threading.Lock,
+) -> list[dict]:
+    """
+    Build jobs list for HTTP endpoint.
+
+    Args:
+        state: MonitorState with jobs
+        lock: Lock for thread-safe state access
+
+    Returns:
+        List of job dictionaries
+    """
+    with lock:
+        jobs_list = []
+        for _job_id, job in state.jobs.items():
+            job_dict = {
+                "job_id": job.job_id,
+                "name": job.name,
+                "user": job.user,
+                "partition": job.partition,
+                "state": job.state.value,
+                "stdout_path": job.stdout_path,
+                "log_submitted": job.log_submitted,
+                "post_success": job.post_success,
+                "result_fetched": job.result_fetched,
+            }
+            if job.last_state:
+                job_dict["last_state"] = job.last_state.value
+            jobs_list.append(job_dict)
+        return jobs_list
+
+
+def get_health_status(
+    state: "MonitorState",
+    lock: threading.Lock,
+    attrsvc_client: Optional["AttrsvcClient"],
+) -> tuple:
+    """
+    Get health status for HTTP endpoint.
+
+    Args:
+        state: MonitorState with SLURM stats
+        lock: Lock for thread-safe state access
+        attrsvc_client: Client to check attrsvc connectivity (may be None)
+
+    Returns:
+        (is_healthy: bool, details: dict)
+    """
+    issues = []
+
+    # Check SLURM connectivity
+    with lock:
+        squeue_calls = state.squeue_calls
+        squeue_failures = state.squeue_failures
+
+    slurm_healthy = True
+    if squeue_calls > 0 and squeue_failures > 0:
+        failure_rate = squeue_failures / squeue_calls
+        if failure_rate >= 0.5:
+            slurm_healthy = False
+            issues.append(f"squeue_failure_rate={failure_rate:.1%}")
+
+    # Check attrsvc connectivity (cached in client to avoid blocking HTTP calls)
+    attrsvc_healthy = attrsvc_client.check_health_cached() if attrsvc_client else False
+
+    if not attrsvc_healthy:
+        issues.append("attrsvc_unreachable")
+
+    is_healthy = slurm_healthy and attrsvc_healthy
+
+    details = {
+        "squeue_calls": squeue_calls,
+        "squeue_failures": squeue_failures,
+        "slurm_healthy": slurm_healthy,
+        "attrsvc_healthy": attrsvc_healthy,
+    }
+    if issues:
+        details["issues"] = issues
+
+    return is_healthy, details
+
+
+def format_stats_summary(
+    stats: dict,
+    attrsvc_stats: dict[str, Any] | None = None,
+) -> str:
+    """
+    Format stats as a one-line summary for logging.
+
+    Args:
+        stats: Stats dictionary from get_stats_dict()
+        attrsvc_stats: Optional attrsvc stats dictionary
+
+    Returns:
+        One-line summary string
+    """
+    jobs = stats["jobs"]
+    cumulative = stats["cumulative"]
+    slurm = stats["slurm"]
+
+    summary = (
+        f"Jobs: {jobs['total']} tracked ({jobs['running']} running, {jobs['terminal']} terminal), "
+        f"Cumulative: {cumulative['total']} seen, "
+        f"{cumulative['has_output_path']} with path, "
+        f"{cumulative['logs_submitted']} submitted, "
+        f"{cumulative['logs_post_success']} post success, "
+        f"{cumulative['results_fetched']} fetched, "
+        f"SLURM: {slurm['squeue_calls']} squeue, "
+        f"{slurm['scontrol_calls']} scontrol, "
+        f"{slurm['sacct_calls']} sacct"
+    )
+
+    if attrsvc_stats:
+        requests = attrsvc_stats.get("requests", {})
+        state = attrsvc_stats.get("state", {})
+        compute = attrsvc_stats.get("compute", {})
+        summary += (
+            f", AttrSvc: {requests.get('cache_hits', 0)} hits, "
+            f"{requests.get('cache_misses', 0)} misses, "
+            f"{state.get('cache_size', 0)} cached, "
+            f"{state.get('in_flight', 0)} in-flight, "
+            f"{compute.get('total', 0)} computes"
+        )
+
+    return summary
