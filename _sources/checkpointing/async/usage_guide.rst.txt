@@ -20,7 +20,7 @@ Implementation Changes and Evolution
 
 * :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.AsyncCallsQueue` is now initialized by default to use :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.PersistentAsyncCaller` instead of :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.TemporalAsyncCaller`.
 
-* :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.PersistentAsyncCaller` spawns a persistent process that runs in a separate CUDA context and forks processes optionally for intra-node parallelism.
+* :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.PersistentAsyncCaller` spawns a persistent process that runs in a separate CUDA context and writes checkpoint files on threads for intra-node parallelism.
 
 * Now, we don't need :py:func:`~nvidia_resiliency_ext.checkpointing.utils.wrap_for_async` anymore because :py:class:`~nvidia_resiliency_ext.checkpointing.async_ckpt.core.PersistentAsyncCaller` is safe to call garbage collection in the spawned process.
 
@@ -250,15 +250,14 @@ Writing the .metadata File
 writes the checkpoint's ``.metadata`` file with its own pickler instead of ``pickle.dump``
 (about 16 times faster on large checkpoints). The file is an ordinary
 pickle that ``torch.distributed.checkpoint`` loads unchanged. The pickler is used on the PyTorch
-versions it was tested with, 2.4 to 2.14; on other versions the file is written with
+versions it was tested with, 2.9 to 2.14; on other versions the file is written with
 ``pickle.dump``, as PyTorch writes it.
 
 The environment variable ``NVRX_FAST_METADATA_PICKLE``, read once per process, changes this:
 
 * ``0``: write the file with ``pickle.dump``.
 * ``python``: use the pure-Python pickler instead of the C++ extension.
-* ``force``: use the pickler on untested PyTorch versions too, except those known not to work with
-  it (2.3), where an error is logged.
+* ``force``: use the pickler on untested PyTorch versions too.
 
 
 Reusing Global Metadata
